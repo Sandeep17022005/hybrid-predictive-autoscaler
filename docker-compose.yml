@@ -1,0 +1,134 @@
+services:
+  # Prometheus for metrics collection
+  prometheus:
+    image: prom/prometheus:v2.45.0
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=24h'
+    networks:
+      - predictive-scaling
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # Grafana for visualization
+  grafana:
+    image: grafana/grafana:10.0.3
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+    networks:
+      - predictive-scaling
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ML Prediction Service
+  ml-service:
+    build:
+      context: ./ml-service
+      dockerfile: Dockerfile
+    container_name: ml-service
+    ports:
+      - "8001:8000"
+    environment:
+      - PROMETHEUS_URL=http://prometheus:9090
+      - PREDICTION_HORIZON_MINUTES=5
+      - PROMETHEUS_RETRIES=3
+    networks:
+      - predictive-scaling
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+
+  # Application Service
+  app-service:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    container_name: app-service
+    ports:
+      - "8000:8000"
+    networks:
+      - predictive-scaling
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
+  # Predictive Scaling Controller
+  scaling-controller:
+    build:
+      context: ./controller
+      dockerfile: Dockerfile
+    container_name: scaling-controller
+    environment:
+      - ML_SERVICE_URL=http://ml-service:8000/predict
+      - DEPLOYMENT_NAME=app-service
+      - NAMESPACE=default
+      - TARGET_RPS_PER_POD=50.0
+      - MIN_REPLICAS=1
+      - MAX_REPLICAS=5
+      - POLL_INTERVAL_SECONDS=10
+      - MAX_SCALE_DELTA=2
+      - SCALE_COOLDOWN_SECONDS=30
+      - CONFIDENCE_THRESHOLD=0.5
+    networks:
+      - predictive-scaling
+    depends_on:
+      - ml-service
+      - app-service
+    restart: unless-stopped
+
+  # Traffic Generator
+  traffic-generator:
+    build:
+      context: ./traffic-generator
+      dockerfile: Dockerfile
+    container_name: traffic-generator
+    environment:
+      - LOCUST_HOST=http://app-service:8000
+    networks:
+      - predictive-scaling
+    depends_on:
+      app-service:
+        condition: service_healthy
+    restart: unless-stopped
+
+networks:
+  predictive-scaling:
+    driver: bridge
+
+volumes:
+  prometheus_data:
+    driver: local

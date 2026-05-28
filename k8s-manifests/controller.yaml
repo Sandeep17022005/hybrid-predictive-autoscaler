@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: predictive-controller-deployment
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: predictive-controller
+  template:
+    metadata:
+      labels:
+        app: predictive-controller
+    spec:
+      serviceAccountName: predictive-controller-sa
+      containers:
+        - name: controller
+          image: scaling-controller:v1.0.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: ML_SERVICE_URL
+              value: "http://ml-prediction-service.default.svc.cluster.local:8000/predict"
+            - name: DEPLOYMENT_NAME
+              value: "app-deployment"
+            - name: NAMESPACE
+              value: "default"
+            - name: TARGET_RPS_PER_POD
+              value: "50.0"
+            - name: MIN_REPLICAS
+              value: "2"
+            - name: MAX_REPLICAS
+              value: "10"
+            - name: POLL_INTERVAL_SECONDS
+              value: "30"
+            - name: MAX_SCALE_DELTA
+              value: "2"
+            - name: SCALE_COOLDOWN_SECONDS
+              value: "60"
+            - name: CONFIDENCE_THRESHOLD
+              value: "0.5"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+      terminationGracePeriodSeconds: 30

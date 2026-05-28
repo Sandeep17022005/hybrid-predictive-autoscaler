@@ -1,0 +1,27 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: traffic-generator-deployment
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: traffic-generator
+  template:
+    metadata:
+      labels:
+        app: traffic-generator
+    spec:
+      containers:
+        - name: generator
+          image: traffic-generator:v1.0.0
+          imagePullPolicy: IfNotPresent
+          command: ["locust", "-f", "locustfile.py", "-H", "http://app-service:8000", "--headless", "-u", "10", "-r", "2", "--run-time", "10m"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
