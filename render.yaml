@@ -1,0 +1,34 @@
+services:
+  # ──────────────────────────────────────────
+  # App Service - FastAPI application
+  # ──────────────────────────────────────────
+  - type: web
+    name: hpa-app-service
+    env: docker
+    dockerfilePath: ./app/Dockerfile
+    dockerContext: ./app
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: 8000
+
+  # ──────────────────────────────────────────
+  # ML Prediction Service - ARIMA model
+  # ──────────────────────────────────────────
+  - type: web
+    name: hpa-ml-service
+    env: docker
+    dockerfilePath: ./ml-service/Dockerfile
+    dockerContext: ./ml-service
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: PROMETHEUS_URL
+        value: https://demo.promlabs.com
+      - key: PREDICTION_HORIZON_MINUTES
+        value: 5
+      - key: PROMETHEUS_RETRIES
+        value: 3
+      - key: PORT
+        value: 8000

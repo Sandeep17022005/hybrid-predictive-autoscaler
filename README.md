@@ -1,5 +1,13 @@
 # Hybrid Predictive AutoScaler
 
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/Sandeep17022005/hybrid-predictive-autoscaler)
+
+> **Live Demo Endpoints** (deployed on Render.com free tier)
+> - 🚀 **App Service:** https://hpa-app-service.onrender.com
+> - 🧠 **ML Prediction API:** https://hpa-ml-service.onrender.com/predict
+> - 📖 **API Docs (App):** https://hpa-app-service.onrender.com/docs
+> - 📖 **API Docs (ML):** https://hpa-ml-service.onrender.com/docs
+
 This project implements an intelligent autoscaling system for Kubernetes that combines machine learning-based predictive scaling with Kubernetes Horizontal Pod Autoscaler (HPA) to improve system performance, reduce latency during spikes, and minimize resource waste.
 
 ## ⚠️ Important: Recent Comprehensive Fixes
