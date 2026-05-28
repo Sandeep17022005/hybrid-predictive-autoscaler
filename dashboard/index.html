@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Hybrid Predictive AutoScaler — Dashboard</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #0a0f1e;
+      --card: #111827;
+      --card2: #1a2235;
+      --border: #1e2d45;
+      --accent: #3b82f6;
+      --accent2: #8b5cf6;
+      --green: #10b981;
+      --yellow: #f59e0b;
+      --red: #ef4444;
+      --text: #e2e8f0;
+      --muted: #64748b;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
+
+    header {
+      background: linear-gradient(135deg, #1a2235 0%, #0f172a 100%);
+      border-bottom: 1px solid var(--border);
+      padding: 1.2rem 2rem;
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    header h1 { font-size: 1.3rem; font-weight: 700; background: linear-gradient(90deg, #3b82f6, #8b5cf6); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+    .status-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--green); box-shadow: 0 0 8px var(--green); animation: pulse 2s infinite; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.5} }
+
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; padding: 1.5rem 2rem 0; }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 1.2rem; }
+    .card-label { font-size: 0.72rem; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; margin-bottom: .5rem; }
+    .card-value { font-size: 2rem; font-weight: 700; }
+    .card-value.blue { color: var(--accent); }
+    .card-value.green { color: var(--green); }
+    .card-value.purple { color: var(--accent2); }
+    .card-value.yellow { color: var(--yellow); }
+    .card-sub { font-size: 0.75rem; color: var(--muted); margin-top: .3rem; }
+
+    .section { padding: 1.5rem 2rem; }
+    .section-title { font-size: 0.85rem; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .1em; margin-bottom: 1rem; }
+
+    .endpoints { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: .75rem; }
+    .endpoint { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 1rem 1.2rem; display: flex; align-items: center; gap: 1rem; transition: border-color .2s; cursor: pointer; text-decoration: none; }
+    .endpoint:hover { border-color: var(--accent); }
+    .endpoint-icon { font-size: 1.5rem; }
+    .endpoint-name { font-size: .9rem; font-weight: 600; color: var(--text); }
+    .endpoint-url { font-size: .75rem; color: var(--muted); font-family: monospace; }
+    .endpoint-badge { margin-left: auto; font-size: .7rem; padding: .2rem .6rem; border-radius: 20px; font-weight: 600; }
+    .badge-live { background: rgba(16,185,129,.15); color: var(--green); }
+    .badge-dry { background: rgba(245,158,11,.15); color: var(--yellow); }
+
+    .prediction-box { background: var(--card2); border: 1px solid var(--border); border-radius: 12px; padding: 1.5rem; }
+    .prediction-row { display: flex; justify-content: space-between; align-items: center; padding: .6rem 0; border-bottom: 1px solid var(--border); }
+    .prediction-row:last-child { border-bottom: none; }
+    .prediction-key { font-size: .85rem; color: var(--muted); }
+    .prediction-val { font-size: .9rem; font-weight: 600; }
+
+    .confidence-bar { height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; margin-top: .4rem; }
+    .confidence-fill { height: 100%; border-radius: 3px; background: linear-gradient(90deg, var(--accent), var(--accent2)); transition: width .5s; }
+
+    footer { text-align: center; padding: 2rem; color: var(--muted); font-size: .75rem; border-top: 1px solid var(--border); margin-top: 2rem; }
+
+    .loading { color: var(--muted); font-size: .85rem; }
+    .error-text { color: var(--red); font-size: .8rem; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>⚡ Hybrid Predictive AutoScaler</h1>
+  <div style="display:flex;align-items:center;gap:.6rem;font-size:.8rem;color:var(--muted)">
+    <div class="status-dot" id="status-dot"></div>
+    <span id="status-text">Connecting...</span>
+  </div>
+</header>
+
+<!-- KPI Cards -->
+<div class="grid">
+  <div class="card">
+    <div class="card-label">Predicted RPS</div>
+    <div class="card-value blue" id="pred-rps">—</div>
+    <div class="card-sub">Next 5 minutes</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Recommended Replicas</div>
+    <div class="card-value purple" id="rec-replicas">—</div>
+    <div class="card-sub">ML recommendation</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Model Confidence</div>
+    <div class="card-value green" id="confidence">—</div>
+    <div class="confidence-bar"><div class="confidence-fill" id="confidence-bar" style="width:0%"></div></div>
+  </div>
+  <div class="card">
+    <div class="card-label">Active Model</div>
+    <div class="card-value yellow" id="model-type">—</div>
+    <div class="card-sub">Current predictor</div>
+  </div>
+</div>
+
+<!-- Latest Prediction Detail -->
+<div class="section">
+  <div class="section-title">Latest Prediction Detail</div>
+  <div class="prediction-box">
+    <div class="prediction-row">
+      <span class="prediction-key">Current Actual RPS</span>
+      <span class="prediction-val" id="current-rps">—</span>
+    </div>
+    <div class="prediction-row">
+      <span class="prediction-key">Peak Predicted RPS</span>
+      <span class="prediction-val" id="peak-rps">—</span>
+    </div>
+    <div class="prediction-row">
+      <span class="prediction-key">Prediction Horizon</span>
+      <span class="prediction-val" id="horizon">—</span>
+    </div>
+    <div class="prediction-row">
+      <span class="prediction-key">Inference Time</span>
+      <span class="prediction-val" id="pred-time">—</span>
+    </div>
+    <div class="prediction-row">
+      <span class="prediction-key">Model Accuracy</span>
+      <span class="prediction-val" id="model-acc">—</span>
+    </div>
+    <div class="prediction-row" id="err-row" style="display:none">
+      <span class="prediction-key">Error</span>
+      <span class="prediction-val error-text" id="pred-error">—</span>
+    </div>
+  </div>
+</div>
+
+<!-- Service Endpoints -->
+<div class="section">
+  <div class="section-title">Service Endpoints</div>
+  <div class="endpoints">
+    <a class="endpoint" href="http://localhost:8000/docs" target="_blank">
+      <div class="endpoint-icon">🚀</div>
+      <div>
+        <div class="endpoint-name">App Service</div>
+        <div class="endpoint-url">localhost:8000</div>
+      </div>
+      <span class="endpoint-badge badge-live">LIVE</span>
+    </a>
+    <a class="endpoint" href="http://localhost:8001/docs" target="_blank">
+      <div class="endpoint-icon">🧠</div>
+      <div>
+        <div class="endpoint-name">ML Prediction Service</div>
+        <div class="endpoint-url">localhost:8001</div>
+      </div>
+      <span class="endpoint-badge badge-live">LIVE</span>
+    </a>
+    <a class="endpoint" href="http://localhost:8002/status" target="_blank">
+      <div class="endpoint-icon">⚙️</div>
+      <div>
+        <div class="endpoint-name">Scaling Controller</div>
+        <div class="endpoint-url">localhost:8002</div>
+      </div>
+      <span class="endpoint-badge badge-dry">DRY RUN</span>
+    </a>
+    <a class="endpoint" href="http://localhost:9090" target="_blank">
+      <div class="endpoint-icon">📊</div>
+      <div>
+        <div class="endpoint-name">Prometheus</div>
+        <div class="endpoint-url">localhost:9090</div>
+      </div>
+      <span class="endpoint-badge badge-live">LIVE</span>
+    </a>
+    <a class="endpoint" href="http://localhost:3000" target="_blank">
+      <div class="endpoint-icon">📈</div>
+      <div>
+        <div class="endpoint-name">Grafana</div>
+        <div class="endpoint-url">localhost:3000 · admin/admin</div>
+      </div>
+      <span class="endpoint-badge badge-live">AUTO-PROVISIONED</span>
+    </a>
+  </div>
+</div>
+
+<footer>Hybrid Predictive AutoScaler · ARIMA + LSTM + Ensemble · Kubernetes HPA</footer>
+
+<script>
+  const ML_URL = 'http://localhost:8001';
+
+  async function fetchPrediction() {
+    try {
+      const res = await fetch(`${ML_URL}/predict`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ metric_name: 'app_request_rate_per_second', horizon_seconds: 300, model_type: 'ensemble' })
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const d = await res.json();
+
+      const peakRPS = Math.max(...d.predictions.map(p => p.value));
+
+      document.getElementById('pred-rps').textContent = peakRPS.toFixed(1);
+      document.getElementById('rec-replicas').textContent = d.recommended_replicas;
+      document.getElementById('confidence').textContent = (d.confidence * 100).toFixed(1) + '%';
+      document.getElementById('confidence-bar').style.width = (d.confidence * 100) + '%';
+      document.getElementById('model-type').textContent = d.model_type.toUpperCase();
+      document.getElementById('current-rps').textContent = d.current_value.toFixed(2) + ' req/s';
+      document.getElementById('peak-rps').textContent = peakRPS.toFixed(2) + ' req/s';
+      document.getElementById('horizon').textContent = (d.predictions.length * 15) + 's';
+      document.getElementById('pred-time').textContent = (d.prediction_time * 1000).toFixed(0) + 'ms';
+      document.getElementById('model-acc').textContent = (d.model_accuracy * 100).toFixed(1) + '%';
+      document.getElementById('err-row').style.display = 'none';
+
+      document.getElementById('status-dot').style.background = '#10b981';
+      document.getElementById('status-text').textContent = 'Live · updated ' + new Date().toLocaleTimeString();
+    } catch (e) {
+      document.getElementById('pred-error').textContent = e.message;
+      document.getElementById('err-row').style.display = 'flex';
+      document.getElementById('status-dot').style.background = '#ef4444';
+      document.getElementById('status-text').textContent = 'ML service unreachable';
+    }
+  }
+
+  fetchPrediction();
+  setInterval(fetchPrediction, 15000);
+</script>
+</body>
+</html>

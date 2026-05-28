@@ -1,0 +1,83 @@
+# ─────────────────────────────────────────────
+# Global Settings
+# ─────────────────────────────────────────────
+namespace: hybrid-autoscaler
+imageRegistry: ghcr.io/sandeep17022005/hybrid-predictive-autoscaler
+
+# ─────────────────────────────────────────────
+# App (Workload) Service
+# ─────────────────────────────────────────────
+appService:
+  image: app-service
+  tag: latest
+  replicas: 2
+  port: 8000
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 512Mi }
+
+# ─────────────────────────────────────────────
+# ML Prediction Service
+# ─────────────────────────────────────────────
+mlService:
+  image: ml-service
+  tag: latest
+  replicas: 1
+  port: 8001
+  modelType: ensemble
+  predictionHorizon: 300
+  historyWindow: 3600
+  confidenceThreshold: "0.7"
+  resources:
+    requests: { cpu: 500m, memory: 512Mi }
+    limits: { cpu: 2000m, memory: 2Gi }
+
+# ─────────────────────────────────────────────
+# Scaling Controller
+# ─────────────────────────────────────────────
+scalingController:
+  image: scaling-controller
+  tag: latest
+  replicas: 1
+  port: 8002
+  config:
+    pollInterval: "30"
+    minReplicas: "2"
+    maxReplicas: "50"
+    scaleUpCooldown: "60"
+    scaleDownCooldown: "300"
+    maxScaleStep: "5"
+    confidenceThreshold: "0.6"
+    predictionWeight: "0.7"
+    reactiveWeight: "0.3"
+    dryRun: "false"
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: 200m, memory: 256Mi }
+
+# ─────────────────────────────────────────────
+# HPA Settings
+# ─────────────────────────────────────────────
+hpa:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 50
+  targetCPUUtilization: 70
+
+# ─────────────────────────────────────────────
+# Prometheus
+# ─────────────────────────────────────────────
+prometheus:
+  enabled: true
+  image: prom/prometheus:v2.48.1
+  port: 9090
+  retentionDays: 7
+
+# ─────────────────────────────────────────────
+# Grafana
+# ─────────────────────────────────────────────
+grafana:
+  enabled: true
+  image: grafana/grafana:10.2.3
+  port: 3000
+  adminPassword: admin

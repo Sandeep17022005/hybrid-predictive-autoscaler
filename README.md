@@ -1,6 +1,7 @@
 # Hybrid Predictive AutoScaler
 
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/Sandeep17022005/hybrid-predictive-autoscaler)
+[![CI/CD](https://github.com/Sandeep17022005/hybrid-predictive-autoscaler/actions/workflows/ci-cd.yaml/badge.svg)](https://github.com/Sandeep17022005/hybrid-predictive-autoscaler/actions)
 
 > **Live Demo Endpoints** (deployed on Render.com free tier)
 > - 🚀 **App Service:** https://hpa-app-service.onrender.com
@@ -8,109 +9,202 @@
 > - 📖 **API Docs (App):** https://hpa-app-service.onrender.com/docs
 > - 📖 **API Docs (ML):** https://hpa-ml-service.onrender.com/docs
 
-This project implements an intelligent autoscaling system for Kubernetes that combines machine learning-based predictive scaling with Kubernetes Horizontal Pod Autoscaler (HPA) to improve system performance, reduce latency during spikes, and minimize resource waste.
+An intelligent Kubernetes autoscaling system that combines **ML-based predictive scaling** (ARIMA + LSTM + Ensemble) with **Kubernetes HPA reactive scaling** — eliminating cold-start latency during traffic spikes while minimising resource waste.
 
-## ⚠️ Important: Recent Comprehensive Fixes
+---
 
-**This codebase has been analyzed and fixed for 37 major and minor issues** including:
-- 🔴 Race conditions and thread safety (asyncio.Lock, threading.Lock)
-- 🟠 Missing health probes, RBAC, and resource limits
-- 🟡 Error handling, validation, and graceful shutdown
-- 🔵 Code quality, logging, and security hardening
+## ⚡ Quick Start — Docker Compose (Local)
 
-**See [FIXES.md](FIXES.md) for the comprehensive list of all issues and their resolutions.**
+**Run the full stack locally in one command:**
 
-Key improvements:
-- ✅ Fixed impossible confidence threshold logic (was blocking all predictions)
-- ✅ Added health probes to all deployments
-- ✅ Added Prometheus RBAC configuration
-- ✅ Added comprehensive error handling and retries
-- ✅ Versioned Docker images (v1.0.0) instead of :latest
-- ✅ Non-root users in containers for security
-- ✅ Structured logging throughout
-- ✅ Environment variable validation with meaningful errors
-
-## Project Architecture
-
-1. **Application Service**: A FastAPI application exposing `/metrics` for Prometheus.
-2. **Monitoring**: Prometheus scrapes metrics, Grafana visualizes them.
-3. **ML Prediction Service**: An ARIMA-based time series model that forecasts Requests Per Second (RPS) 5 minutes into the future based on historical Prometheus data.
-4. **Predictive Scaling Controller**: A custom Python Kubernetes operator that polls the ML Prediction Service and proactively scales the Application Service Deployment *up* before load increases.
-5. **Reactive HPA**: A standard Kubernetes HPA serves as a fallback to scale the deployment based on real-time CPU utilization.
-6. **Traffic Generator**: A Locust script simulating normal, gradual, and spiky traffic to test the hybrid algorithms.
-
-## Prerequisites
-- Docker
-- Minikube
-- `kubectl`
-
-## Deployment Instructions
-
-### 1. Start Minikube
-Start a Minikube cluster with the metrics-server addon enabled (required for HPA).
 ```bash
-minikube start --driver=docker --addons=metrics-server
+git clone https://github.com/Sandeep17022005/hybrid-predictive-autoscaler.git
+cd hybrid-predictive-autoscaler
+docker compose up -d --build
 ```
 
-### 2. Build Docker Images
-Point your local Docker daemon to the Minikube docker daemon, then build the images.
+| Service | URL | Description |
+|---|---|---|
+| 🚀 App Service | http://localhost:8000 | FastAPI workload + metrics |
+| 🧠 ML Service | http://localhost:8001/docs | ARIMA+LSTM+Ensemble prediction |
+| ⚙️ Controller Status | http://localhost:8002/status | Hybrid scaler status |
+| 📊 Prometheus | http://localhost:9090 | Metrics collection |
+| 📈 Grafana | http://localhost:3000 | Auto-provisioned dashboard (admin/admin) |
+| 🖥️ Web Dashboard | http://localhost:8080 | Live prediction dashboard |
+
 ```bash
-eval $(minikube docker-env)
+# Test the ML prediction API
+curl -X POST http://localhost:8001/predict \
+  -H "Content-Type: application/json" \
+  -d '{"model_type": "ensemble", "horizon_seconds": 300}'
 
-# Build App Service
-docker build -t app-service:latest ./app
+# Check controller status
+curl http://localhost:8002/status
 
-# Build ML Service
-docker build -t ml-service:latest ./ml-service
+# View scaling logs
+docker compose logs -f scaling-controller
 
-# Build Predictive Controller
-docker build -t scaling-controller:latest ./controller
-
-# Build Traffic Generator
-docker build -t traffic-generator:latest ./traffic-generator
+# Stop everything
+docker compose down
 ```
 
-### 3. Deploy the Stack
-Deploy Prometheus and Grafana first:
-```bash
-kubectl apply -f k8s-manifests/monitoring/
+---
+
+## 🏗️ Architecture
+
+```
+Traffic Generator → App Service → Prometheus
+                                      ↓
+                              ML Service (ARIMA+LSTM+Ensemble)
+                                      ↓ /predict
+                              Scaling Controller
+                           (Hybrid: Predictive + Reactive)
+                                      ↓
+                         Kubernetes Deployment Scale API
+                         (or Dry-run log in local mode)
 ```
 
-Deploy the Application, ML Service, custom Scaling Controller, and HPA:
+See [docs/architecture.md](docs/architecture.md) for full data flow and component details.
+
+---
+
+## 🧠 ML Models
+
+| Model | Algorithm | Best For |
+|---|---|---|
+| **ARIMA** | Statistical autoregressive | Stable, linear traffic |
+| **LSTM** | PyTorch deep learning | Non-linear complex patterns |
+| **Ensemble** ⭐ | Weighted ARIMA+LSTM blend | **Production default** |
+
+Switch models per-request:
 ```bash
-kubectl apply -f k8s-manifests/rbac.yaml
-kubectl apply -f k8s-manifests/app-deployment.yaml
-kubectl apply -f k8s-manifests/ml-service.yaml
-kubectl apply -f k8s-manifests/controller.yaml
-kubectl apply -f k8s-manifests/hpa.yaml
+curl -X POST http://localhost:8001/predict \
+  -d '{"model_type": "arima"}'   # or "lstm" or "ensemble"
 ```
 
-### 4. Verify Deployments
-Ensure all pods are running successfully:
+---
+
+## ⚙️ Hybrid Scaling Algorithm
+
+```python
+if confidence >= 0.6:       # HIGH — trust prediction
+    target = 0.7 * predicted_replicas + 0.3 * current_replicas
+elif confidence >= 0.4:     # MEDIUM — conservative blend
+    target = average(current, predicted)
+else:                       # LOW — defer to HPA
+    target = current_replicas
+```
+
+**Safety mechanisms:** cooldowns (60s up / 300s down), max step size (5 pods), anti-flapping (3 consecutive), dry-run mode.
+
+---
+
+## 📡 API Reference
+
+### ML Service (`:8001`)
+| Endpoint | Method | Description |
+|---|---|---|
+| `/predict` | POST | Generate prediction (ARIMA/LSTM/Ensemble) |
+| `/predict/quick` | GET | Quick prediction with defaults |
+| `/models` | GET | List available models |
+| `/accuracy` | GET | MAPE/RMSE accuracy metrics |
+| `/history` | GET | Recent prediction log |
+| `/health` | GET | Health check |
+| `/metrics` | GET | Prometheus metrics |
+
+### Controller (`:8002`)
+| Endpoint | Method | Description |
+|---|---|---|
+| `/health` | GET | Health check |
+| `/status` | GET | Config + scaling state |
+| `/metrics` | GET | Prometheus metrics |
+
+---
+
+## ☸️ Kubernetes Deployment
+
+### Using kubectl
 ```bash
-kubectl get pods
+kubectl apply -f k8s-manifests/
+kubectl get pods -n default
 kubectl get hpa
 ```
 
-### 5. Generate Traffic
-To test the autoscaler, start the Traffic Generator deployment:
+### Using Helm
 ```bash
-kubectl apply -f k8s-manifests/traffic-generator.yaml
-```
-The Locust script is configured with a `SpikyLoadShape` which simulates variable load over a few minutes.
-
-### 6. Monitor
-You can access Grafana to visualize metrics.
-```bash
-minikube service grafana-service
-```
-*(Default Grafana login is anonymous)*
-
-You can also view the logs of the predictive controller to see its scaling decisions:
-```bash
-kubectl logs -l app=predictive-controller -f
+helm install hybrid-autoscaler helm/hybrid-autoscaler/ \
+  --namespace hybrid-autoscaler \
+  --create-namespace \
+  --set scalingController.config.dryRun=false \
+  --wait
 ```
 
-## Hybrid Scaling Logic Details
-- **Predictive (Proactive)**: The `predictive-controller` queries the ML API. If predicted RPS mandates more pods than currently exist, it patches the deployment to scale *up*. It never scales *down*.
-- **Reactive (Corrective)**: The `HorizontalPodAutoscaler` continually monitors CPU. If the predictor fails to catch a spike, HPA scales up. When the traffic dies down, the HPA will eventually scale the deployment down (since the custom controller defers scale-down operations to the strict CPU metric).
+### Prerequisites
+- Docker 24+
+- Minikube / kind / any Kubernetes cluster
+- `kubectl` configured
+- Helm 3.x (optional)
+
+---
+
+## 📊 Monitoring
+
+- **Grafana dashboard** auto-provisions on startup (no manual setup)
+- **Prometheus alert rules** fire on: high latency, high error rate, service down, traffic spike
+- **Web dashboard** at `localhost:8080` shows live ML predictions
+
+---
+
+## 📁 Project Structure
+
+```
+hybrid-predictive-autoscaler/
+├── app/                    # FastAPI workload service
+├── ml-service/             # ARIMA + LSTM + Ensemble prediction
+├── controller/             # Hybrid scaling controller
+├── traffic-generator/      # Locust load generator
+├── dashboard/              # Web dashboard (served by nginx)
+├── dashboards/grafana/     # Grafana dashboard + auto-provisioning
+├── monitoring/prometheus/  # Prometheus config + alert rules
+├── k8s-manifests/          # Kubernetes manifests
+├── helm/                   # Helm chart
+├── docs/                   # Architecture documentation
+├── .github/workflows/      # GitHub Actions CI/CD
+├── docker-compose.yml      # Full local stack
+└── render.yaml             # Render.com deployment
+```
+
+---
+
+## 🔧 Configuration
+
+Key environment variables for the Scaling Controller:
+
+| Variable | Default | Description |
+|---|---|---|
+| `DRY_RUN` | `true` | Simulate scaling (set `false` for real scaling) |
+| `MIN_REPLICAS` | `2` | Minimum pod count |
+| `MAX_REPLICAS` | `50` | Maximum pod count |
+| `CONFIDENCE_THRESHOLD` | `0.6` | Min confidence to trust prediction |
+| `SCALE_UP_COOLDOWN` | `60` | Seconds between scale-ups |
+| `SCALE_DOWN_COOLDOWN` | `300` | Seconds between scale-downs |
+| `POLL_INTERVAL` | `30` | Seconds between scaling checks |
+
+---
+
+## ⚠️ Recent Fixes (v1.0)
+
+This codebase was analyzed and fixed for 37 issues including:
+- ✅ Race conditions and thread safety (asyncio.Lock)
+- ✅ Impossible confidence threshold logic
+- ✅ Missing health probes, RBAC, resource limits
+- ✅ Non-root container users (security hardening)
+- ✅ Graceful shutdown signal handling
+- ✅ Anti-flapping logic in controller
+- ✅ Structured logging throughout
+
+---
+
+## 📄 License
+
+MIT License — see [LICENSE](LICENSE) for details.

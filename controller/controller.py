@@ -1,233 +1,656 @@
-import os
-import time
-import requests
+﻿"""
+Hybrid Predictive Autoscaler - Scaling Controller
+===================================================
+Custom Kubernetes controller that implements hybrid scaling logic:
+  1. Fetches predictions from ML service
+  2. Reads current HPA state
+  3. Applies hybrid scaling algorithm
+  4. Scales deployments via Kubernetes API
+  5. Enforces safety mechanisms (cooldowns, bounds, rate limiting)
+
+This controller runs as a Deployment inside the cluster.
+"""
+
+import asyncio
+import json
 import logging
-import threading
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-from kubernetes import client, config
+import os
+import signal
+import time
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Optional
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+import httpx
+from prometheus_client import (
+    CollectorRegistry,
+    Counter,
+    Gauge,
+    generate_latest,
+)
 
-# Configuration with validation
-def validate_env_config():
-    """Validate and parse environment variables with meaningful error messages."""
-    try:
-        ml_service_url = os.getenv("ML_SERVICE_URL", "http://ml-prediction-service:8000/predict")
-        target_rps = float(os.getenv("TARGET_RPS_PER_POD", "50.0"))
-        deployment_name = os.getenv("DEPLOYMENT_NAME", "app-deployment")
-        namespace = os.getenv("NAMESPACE", "default")
-        min_replicas = int(os.getenv("MIN_REPLICAS", "2"))
-        max_replicas = int(os.getenv("MAX_REPLICAS", "10"))
-        poll_interval = int(os.getenv("POLL_INTERVAL_SECONDS", "30"))
-        max_scale_delta = int(os.getenv("MAX_SCALE_DELTA", "2"))
-        scale_cooldown = int(os.getenv("SCALE_COOLDOWN_SECONDS", "60"))
-        confidence_threshold = float(os.getenv("CONFIDENCE_THRESHOLD", "0.5"))
-        
-        # Validate ranges
-        if min_replicas <= 0:
-            raise ValueError(f"MIN_REPLICAS must be > 0, got {min_replicas}")
-        if max_replicas < min_replicas:
-            raise ValueError(f"MAX_REPLICAS ({max_replicas}) must be >= MIN_REPLICAS ({min_replicas})")
-        if target_rps <= 0:
-            raise ValueError(f"TARGET_RPS_PER_POD must be > 0 (division by zero risk), got {target_rps}")
-        if poll_interval <= 0:
-            raise ValueError(f"POLL_INTERVAL_SECONDS must be > 0, got {poll_interval}")
-        if confidence_threshold < 0 or confidence_threshold > 1.0:
-            raise ValueError(f"CONFIDENCE_THRESHOLD must be in [0.0, 1.0], got {confidence_threshold}")
-        
-        return {
-            "ml_service_url": ml_service_url,
-            "target_rps": target_rps,
-            "deployment_name": deployment_name,
-            "namespace": namespace,
-            "min_replicas": min_replicas,
-            "max_replicas": max_replicas,
-            "poll_interval": poll_interval,
-            "max_scale_delta": max_scale_delta,
-            "scale_cooldown": scale_cooldown,
-            "confidence_threshold": confidence_threshold,
+# ──────────────────────────────────────────────
+# Configuration
+# ──────────────────────────────────────────────
+PREDICTION_SERVICE_URL = os.getenv(
+    "PREDICTION_SERVICE_URL", "http://prediction-service:8001"
+)
+NAMESPACE = os.getenv("NAMESPACE", "default")
+TARGET_DEPLOYMENT = os.getenv("TARGET_DEPLOYMENT", "workload-service")
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "30"))  # seconds
+MIN_REPLICAS = int(os.getenv("MIN_REPLICAS", "2"))
+MAX_REPLICAS = int(os.getenv("MAX_REPLICAS", "50"))
+SCALE_UP_COOLDOWN = int(os.getenv("SCALE_UP_COOLDOWN", "60"))  # seconds
+SCALE_DOWN_COOLDOWN = int(os.getenv("SCALE_DOWN_COOLDOWN", "300"))  # seconds
+MAX_SCALE_STEP = int(os.getenv("MAX_SCALE_STEP", "5"))  # max pods per scaling event
+CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.6"))
+PREDICTION_WEIGHT = float(os.getenv("PREDICTION_WEIGHT", "0.7"))
+REACTIVE_WEIGHT = float(os.getenv("REACTIVE_WEIGHT", "0.3"))
+DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("scaling-controller")
+
+# ──────────────────────────────────────────────
+# Prometheus Metrics
+# ──────────────────────────────────────────────
+ctrl_registry = CollectorRegistry()
+
+SCALING_EVENTS_TOTAL = Counter(
+    "controller_scaling_events_total",
+    "Total scaling events",
+    ["decision", "source"],
+    registry=ctrl_registry,
+)
+
+CURRENT_REPLICAS_GAUGE = Gauge(
+    "controller_current_replicas",
+    "Current replica count",
+    registry=ctrl_registry,
+)
+
+PREDICTED_RPS_GAUGE = Gauge(
+    "controller_predicted_rps",
+    "Latest predicted RPS from ML service",
+    registry=ctrl_registry,
+)
+
+CONFIDENCE_GAUGE = Gauge(
+    "controller_prediction_confidence",
+    "Latest prediction confidence used for scaling",
+    registry=ctrl_registry,
+)
+
+
+# ──────────────────────────────────────────────
+# Data Models
+# ──────────────────────────────────────────────
+class ScalingDecision(Enum):
+    SCALE_UP = "scale_up"
+    SCALE_DOWN = "scale_down"
+    NO_CHANGE = "no_change"
+    FALLBACK_REACTIVE = "fallback_reactive"
+
+
+@dataclass
+class ScalingEvent:
+    timestamp: float
+    decision: ScalingDecision
+    source: str  # "predictive", "reactive", "hybrid"
+    current_replicas: int
+    target_replicas: int
+    predicted_rps: float
+    confidence: float
+    reason: str
+
+
+@dataclass
+class ScalingState:
+    current_replicas: int = MIN_REPLICAS
+    last_scale_up_time: float = 0.0
+    last_scale_down_time: float = 0.0
+    consecutive_scale_ups: int = 0
+    consecutive_scale_downs: int = 0
+    events: list[ScalingEvent] = field(default_factory=list)
+    total_scale_ups: int = 0
+    total_scale_downs: int = 0
+
+
+# ──────────────────────────────────────────────
+# Kubernetes Client
+# ──────────────────────────────────────────────
+class KubernetesClient:
+    """
+    Kubernetes API client for scaling operations.
+    Uses in-cluster config when running inside K8s,
+    falls back to kubeconfig for local development.
+    """
+
+    def __init__(self):
+        self.in_cluster = os.path.exists(
+            "/var/run/secrets/kubernetes.io/serviceaccount/token"
+        )
+        self.api_base = ""
+        self.headers = {}
+        self._setup()
+
+    def _setup(self):
+        if self.in_cluster:
+            self.api_base = "https://kubernetes.default.svc"
+            token_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+            with open(token_path) as f:
+                token = f.read().strip()
+            self.headers = {"Authorization": f"Bearer {token}"}
+            logger.info("Using in-cluster Kubernetes configuration")
+        else:
+            self.api_base = "http://localhost:8001"  # kubectl proxy
+            logger.info("Using kubectl proxy (localhost:8001)")
+
+    async def get_deployment(
+        self, name: str, namespace: str
+    ) -> Optional[dict]:
+        """Get deployment details."""
+        url = (
+            f"{self.api_base}/apis/apps/v1"
+            f"/namespaces/{namespace}/deployments/{name}"
+        )
+        try:
+            async with httpx.AsyncClient(
+                verify=False, timeout=10.0
+            ) as client:
+                response = await client.get(url, headers=self.headers)
+                if response.status_code == 200:
+                    return response.json()
+                logger.error(f"Get deployment failed: {response.status_code}")
+                return None
+        except Exception as e:
+            logger.error(f"Failed to get deployment: {e}")
+            return None
+
+    async def scale_deployment(
+        self, name: str, namespace: str, replicas: int
+    ) -> bool:
+        """Scale a deployment to the specified replica count."""
+        url = (
+            f"{self.api_base}/apis/apps/v1"
+            f"/namespaces/{namespace}/deployments/{name}/scale"
+        )
+        scale_body = {
+            "apiVersion": "autoscaling/v1",
+            "kind": "Scale",
+            "metadata": {"name": name, "namespace": namespace},
+            "spec": {"replicas": replicas},
         }
-    except ValueError as e:
-        logger.error(f"Configuration error: {e}")
-        raise
 
-config_vars = validate_env_config()
-ML_SERVICE_URL = config_vars["ml_service_url"]
-TARGET_RPS_PER_POD = config_vars["target_rps"]
-DEPLOYMENT_NAME = config_vars["deployment_name"]
-NAMESPACE = config_vars["namespace"]
-MIN_REPLICAS = config_vars["min_replicas"]
-MAX_REPLICAS = config_vars["max_replicas"]
-POLL_INTERVAL_SECONDS = config_vars["poll_interval"]
-MAX_SCALE_DELTA = config_vars["max_scale_delta"]
-SCALE_COOLDOWN_SECONDS = config_vars["scale_cooldown"]
-CONFIDENCE_THRESHOLD = config_vars["confidence_threshold"]
-
-# Thread-safe state management
-last_scale_ts_lock = threading.Lock()
-last_scale_ts = 0
-
-def create_session_with_retries():
-    """Create a requests Session with configured retry strategy for resilience."""
-    session = requests.Session()
-    retry_strategy = Retry(
-        total=3,
-        backoff_factor=1,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"]
-    )
-    adapter = HTTPAdapter(max_retries=retry_strategy)
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    return session
-
-def main():
-    """Main predictive scaling controller loop."""
-    logger.info("Starting Predictive Scaling Controller...")
-    logger.info(f"Configuration: Min={MIN_REPLICAS}, Max={MAX_REPLICAS}, TargetRPS={TARGET_RPS_PER_POD}, ConfidenceThreshold={CONFIDENCE_THRESHOLD}")
-    
-    # Load Kubernetes config depending on if we are running in-cluster or out
-    try:
-        config.load_incluster_config()
-        logger.info("Loaded in-cluster Kubernetes config.")
-    except config.config_exception.ConfigException:
-        logger.info("Falling back to local kube config.")
         try:
-            config.load_kube_config()
-            logger.info("Loaded local Kubernetes config.")
-        except config.config_exception.ConfigException as e:
-            logger.warning(f"Not running in Kubernetes environment: {e}")
-            logger.warning("Running in Docker Compose mode - monitoring metrics only (no scaling)")
-            # In Docker Compose mode, just run as a metrics monitor
-            run_metrics_monitor()
-            return
+            async with httpx.AsyncClient(
+                verify=False, timeout=10.0
+            ) as client:
+                response = await client.put(
+                    url,
+                    json=scale_body,
+                    headers={**self.headers, "Content-Type": "application/json"},
+                )
+                if response.status_code in (200, 201):
+                    logger.info(
+                        f"[OK] Scaled {name} to {replicas} replicas"
+                    )
+                    return True
+                logger.error(
+                    f"Scale failed: {response.status_code} - {response.text}"
+                )
+                return False
+        except Exception as e:
+            logger.error(f"Failed to scale deployment: {e}")
+            return False
+
+    async def get_current_replicas(
+        self, name: str, namespace: str
+    ) -> int:
+        """Get current replica count for a deployment."""
+        deployment = await self.get_deployment(name, namespace)
+        if deployment:
+            return deployment.get("spec", {}).get("replicas", MIN_REPLICAS)
+        return MIN_REPLICAS
+
+    async def get_hpa(
+        self, name: str, namespace: str
+    ) -> Optional[dict]:
+        """Get HPA details."""
+        url = (
+            f"{self.api_base}/apis/autoscaling/v2"
+            f"/namespaces/{namespace}/horizontalpodautoscalers/{name}"
+        )
+        try:
+            async with httpx.AsyncClient(
+                verify=False, timeout=10.0
+            ) as client:
+                response = await client.get(url, headers=self.headers)
+                if response.status_code == 200:
+                    return response.json()
+                return None
+        except Exception as e:
+            logger.warning(f"Failed to get HPA: {e}")
+            return None
+
+
+# ──────────────────────────────────────────────
+# Prediction Client
+# ──────────────────────────────────────────────
+class PredictionClient:
+    """Client for the ML Prediction Service."""
+
+    def __init__(self, base_url: str):
+        self.base_url = base_url.rstrip("/")
+
+    async def get_prediction(self) -> Optional[dict]:
+        """Fetch prediction from ML service."""
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    f"{self.base_url}/predict",
+                    json={
+                        "metric_name": "app_request_rate_per_second",
+                        "horizon_seconds": 300,
+                        "model_type": "ensemble",
+                    },
+                )
+                if response.status_code == 200:
+                    return response.json()
+                logger.error(
+                    f"Prediction request failed: {response.status_code}"
+                )
+                return None
+        except Exception as e:
+            logger.error(f"Failed to get prediction: {e}")
+            return None
+
+
+# ──────────────────────────────────────────────
+# Hybrid Scaling Algorithm
+# ──────────────────────────────────────────────
+class HybridScaler:
+    """
+    Implements the hybrid scaling algorithm that combines:
+    - Predictive scaling (proactive, ML-based)
+    - Reactive scaling (HPA-based, safety layer)
+    
+    Algorithm:
+    1. Get prediction from ML service
+    2. Check prediction confidence
+    3. If high confidence: use predictive scaling
+    4. If low confidence: blend with reactive or fallback
+    5. Apply safety mechanisms (cooldowns, rate limits, bounds)
+    """
+
+    def __init__(self):
+        self.state = ScalingState()
+        self.k8s_client = KubernetesClient()
+        self.prediction_client = PredictionClient(PREDICTION_SERVICE_URL)
+
+    def _apply_safety_checks(
+        self,
+        current_replicas: int,
+        target_replicas: int,
+        confidence: float,
+    ) -> tuple[int, str]:
+        """
+        Apply safety mechanisms to prevent aggressive scaling.
+        Returns (safe_target, reason).
+        """
+        now = time.time()
+
+        # 1. Apply bounds
+        target_replicas = max(MIN_REPLICAS, min(MAX_REPLICAS, target_replicas))
+
+        # 2. Rate limiting — max step size
+        delta = target_replicas - current_replicas
+        if abs(delta) > MAX_SCALE_STEP:
+            direction = 1 if delta > 0 else -1
+            target_replicas = current_replicas + (direction * MAX_SCALE_STEP)
+            logger.info(
+                f"[WARN] Rate-limited scaling to step of {MAX_SCALE_STEP}"
+            )
+
+        # 3. Cooldown enforcement
+        if target_replicas > current_replicas:
+            # Scale-up cooldown
+            if now - self.state.last_scale_up_time < SCALE_UP_COOLDOWN:
+                remaining = SCALE_UP_COOLDOWN - (now - self.state.last_scale_up_time)
+                return current_replicas, f"Scale-up cooldown active ({remaining:.0f}s remaining)"
+        elif target_replicas < current_replicas:
+            # Scale-down cooldown (longer to avoid flapping)
+            if now - self.state.last_scale_down_time < SCALE_DOWN_COOLDOWN:
+                remaining = SCALE_DOWN_COOLDOWN - (now - self.state.last_scale_down_time)
+                return current_replicas, f"Scale-down cooldown active ({remaining:.0f}s remaining)"
+
+        # 4. Confidence-based adjustment
+        if confidence < 0.4:
+            # Very low confidence: conservative approach
+            if target_replicas > current_replicas:
+                # Only allow small scale-up
+                max_increase = max(1, int((target_replicas - current_replicas) * 0.5))
+                target_replicas = current_replicas + max_increase
+                return target_replicas, "Low confidence: conservative scale-up"
+            else:
+                # Don't scale down on low confidence
+                return current_replicas, "Low confidence: holding current replicas"
+
+        # 5. Anti-flapping: if we've been scaling up and down rapidly, pause
+        if (
+            self.state.consecutive_scale_ups >= 3
+            and target_replicas < current_replicas
+        ):
+            return current_replicas, "Anti-flapping: too many consecutive scale-ups"
+        if (
+            self.state.consecutive_scale_downs >= 3
+            and target_replicas > current_replicas
+        ):
+            self.state.consecutive_scale_downs = 0  # Reset, allow scale-up
+
+        return target_replicas, "Safety checks passed"
+
+    async def compute_scaling_decision(self) -> ScalingEvent:
+        """
+        Core hybrid scaling algorithm.
         
-    apps_v1 = client.AppsV1Api()
-    session = create_session_with_retries()
-    
-    while True:
-        try:
-            # 1. Fetch the latest prediction
-            try:
-                resp = session.get(ML_SERVICE_URL, timeout=5)
-                resp.raise_for_status()
-                data = resp.json()
-            except requests.exceptions.RequestException as e:
-                logger.error(f"Error accessing ML Service: {e}")
-                time.sleep(POLL_INTERVAL_SECONDS)
-                continue
-            
-            if data.get("status") != "ready":
-                logger.info(f"ML API returned status '{data.get('status')}', skipping scaling.")
-                time.sleep(POLL_INTERVAL_SECONDS)
-                continue
-                
-            predicted_rps = data.get("predicted_rps", 0.0)
-            
-            # Calculate confidence metric from confidence bounds
-            # If both bounds exist, use the average as a confidence proxy
-            # Otherwise use a default neutral value
-            confidence_lower = data.get("confidence_lower")
-            confidence_upper = data.get("confidence_upper")
-            
-            if confidence_lower is not None and confidence_upper is not None:
-                confidence_interval_width = confidence_upper - confidence_lower
-                # Narrower interval = higher confidence. Normalize to [0,1] scale
-                # Assuming typical RPS range 0-200, normalize interval width
-                confidence = max(0.0, 1.0 - (confidence_interval_width / (predicted_rps + 1)))
-            else:
-                confidence = CONFIDENCE_THRESHOLD  # Use threshold as default
+        Pseudocode:
+        1. FETCH prediction from ML service
+        2. READ current deployment state
+        3. IF prediction confidence >= threshold:
+              target = weighted_blend(predicted_replicas, hpa_replicas)
+        4. ELSE:
+              target = hpa_replicas  (fallback to reactive)
+        5. APPLY safety checks (cooldowns, rate limits, bounds)
+        6. EXECUTE scaling if target != current
+        """
+        now = time.time()
 
-            # 2. Calculate Required Pods
-            required_pods = int(predicted_rps / TARGET_RPS_PER_POD) if predicted_rps > 0 else MIN_REPLICAS
-            required_pods = max(MIN_REPLICAS, min(required_pods, MAX_REPLICAS))
+        # Get current state
+        current_replicas = await self.k8s_client.get_current_replicas(
+            TARGET_DEPLOYMENT, NAMESPACE
+        )
+        self.state.current_replicas = current_replicas
 
-            # 3. Get current replicas
-            try:
-                deployment = apps_v1.read_namespaced_deployment(DEPLOYMENT_NAME, NAMESPACE)
-                current_replicas = deployment.spec.replicas or MIN_REPLICAS
-            except client.exceptions.ApiException as e:
-                logger.error(f"Kubernetes API Error reading deployment: {e}")
-                time.sleep(POLL_INTERVAL_SECONDS)
-                continue
+        # Get prediction
+        prediction = await self.prediction_client.get_prediction()
 
-            logger.info(f"Predicted RPS: {predicted_rps:.2f} | Required Pods: {required_pods} | Current Replicas: {current_replicas} | Confidence: {confidence:.2f}")
+        if prediction is None:
+            # Prediction service unavailable — fallback to reactive
+            return ScalingEvent(
+                timestamp=now,
+                decision=ScalingDecision.FALLBACK_REACTIVE,
+                source="reactive",
+                current_replicas=current_replicas,
+                target_replicas=current_replicas,
+                predicted_rps=0,
+                confidence=0,
+                reason="Prediction service unavailable — relying on HPA",
+            )
 
-            # 4. Proactive Scale Up (Scale down handled by HPA)
-            if required_pods > current_replicas:
-                if confidence < CONFIDENCE_THRESHOLD:
-                    logger.info(f"Skip scale action because confidence {confidence:.2f} < threshold {CONFIDENCE_THRESHOLD:.2f}")
-                else:
-                    with last_scale_ts_lock:
-                        time_since_last_scale = time.time() - last_scale_ts
-                        if time_since_last_scale < SCALE_COOLDOWN_SECONDS:
-                            logger.info(f"Skip scale action because cooldown period has not elapsed ({time_since_last_scale:.0f}s < {SCALE_COOLDOWN_SECONDS}s).")
-                            time.sleep(POLL_INTERVAL_SECONDS)
-                            continue
-                    
-                    desired_pods = min(current_replicas + MAX_SCALE_DELTA, required_pods)
-                    desired_pods = max(MIN_REPLICAS, min(desired_pods, MAX_REPLICAS))
+        predicted_rps = max(
+            p["value"] for p in prediction["predictions"]
+        )
+        confidence = prediction["confidence"]
+        recommended_replicas = prediction["recommended_replicas"]
 
-                    if desired_pods > current_replicas:
-                        try:
-                            logger.info(f"Action: Proactively scaling UP {DEPLOYMENT_NAME} to {desired_pods} replicas.")
-                            patch = {"spec": {"replicas": desired_pods}}
-                            apps_v1.patch_namespaced_deployment(
-                                name=DEPLOYMENT_NAME,
-                                namespace=NAMESPACE,
-                                body=patch
-                            )
-                            with last_scale_ts_lock:
-                                last_scale_ts = time.time()
-                            logger.info("Scale up successful.")
-                        except client.exceptions.ApiException as e:
-                            logger.error(f"Kubernetes API Error during patch: {e}")
-            else:
-                logger.debug("No proactive scale up required. HPA remains responsible for drift and scale downs.")
-                
-        except Exception as e:
-            logger.error(f"Unexpected error in main loop: {e}", exc_info=True)
-            
-        time.sleep(POLL_INTERVAL_SECONDS)
+        # ── Hybrid Decision Logic ──
+        if confidence >= CONFIDENCE_THRESHOLD:
+            # High confidence: use predictive scaling with blend
+            predictive_target = recommended_replicas
+            reactive_target = current_replicas  # HPA will handle reactively
 
-def run_metrics_monitor():
-    """Run in Docker Compose mode - just monitor metrics without scaling."""
+            # Weighted blend
+            hybrid_target = int(
+                PREDICTION_WEIGHT * predictive_target
+                + REACTIVE_WEIGHT * reactive_target
+            )
+            source = "predictive"
+            reason = (
+                f"High confidence ({confidence:.2f}): "
+                f"predicted={predictive_target}, blend={hybrid_target}"
+            )
+        elif confidence >= 0.4:
+            # Medium confidence: conservative predictive
+            predictive_target = recommended_replicas
+            # Use average of current and predicted
+            hybrid_target = int((current_replicas + predictive_target) / 2)
+            source = "hybrid"
+            reason = (
+                f"Medium confidence ({confidence:.2f}): "
+                f"conservative blend={hybrid_target}"
+            )
+        else:
+            # Low confidence: fallback to reactive (let HPA handle it)
+            hybrid_target = current_replicas
+            source = "reactive"
+            reason = (
+                f"Low confidence ({confidence:.2f}): "
+                f"fallback to HPA reactive scaling"
+            )
+
+        # Apply safety mechanisms
+        safe_target, safety_reason = self._apply_safety_checks(
+            current_replicas, hybrid_target, confidence
+        )
+
+        if safe_target != hybrid_target:
+            reason += f" | Safety: {safety_reason}"
+            hybrid_target = safe_target
+
+        # Determine decision type
+        if hybrid_target > current_replicas:
+            decision = ScalingDecision.SCALE_UP
+        elif hybrid_target < current_replicas:
+            decision = ScalingDecision.SCALE_DOWN
+        else:
+            decision = ScalingDecision.NO_CHANGE
+
+        event = ScalingEvent(
+            timestamp=now,
+            decision=decision,
+            source=source,
+            current_replicas=current_replicas,
+            target_replicas=hybrid_target,
+            predicted_rps=predicted_rps,
+            confidence=confidence,
+            reason=reason,
+        )
+
+        return event
+
+    async def execute_scaling(self, event: ScalingEvent) -> bool:
+        """Execute scaling decision."""
+        if event.decision == ScalingDecision.NO_CHANGE:
+            logger.info(
+                f"[HOLD] No scaling needed: {event.current_replicas} replicas | {event.reason}"
+            )
+            return True
+
+        if event.decision == ScalingDecision.FALLBACK_REACTIVE:
+            logger.warning(f"[FALLBACK] Fallback to reactive: {event.reason}")
+            return True
+
+        logger.info(
+            f"{'[UP]' if event.decision == ScalingDecision.SCALE_UP else '[DOWN]'} "
+            f"Scaling {event.decision.value}: "
+            f"{event.current_replicas} → {event.target_replicas} "
+            f"(source: {event.source}, confidence: {event.confidence:.2f})"
+        )
+        logger.info(f"   Reason: {event.reason}")
+
+        if DRY_RUN:
+            logger.info("[DRY] DRY RUN -- skipping actual scaling")
+            success = True
+        else:
+            success = await self.k8s_client.scale_deployment(
+                TARGET_DEPLOYMENT, NAMESPACE, event.target_replicas
+            )
+
+        if success:
+            now = time.time()
+            if event.decision == ScalingDecision.SCALE_UP:
+                self.state.last_scale_up_time = now
+                self.state.consecutive_scale_ups += 1
+                self.state.consecutive_scale_downs = 0
+                self.state.total_scale_ups += 1
+            elif event.decision == ScalingDecision.SCALE_DOWN:
+                self.state.last_scale_down_time = now
+                self.state.consecutive_scale_downs += 1
+                self.state.consecutive_scale_ups = 0
+                self.state.total_scale_downs += 1
+
+            self.state.current_replicas = event.target_replicas
+
+        # Update Prometheus metrics
+        SCALING_EVENTS_TOTAL.labels(
+            decision=event.decision.value, source=event.source
+        ).inc()
+        CURRENT_REPLICAS_GAUGE.set(event.target_replicas)
+        PREDICTED_RPS_GAUGE.set(event.predicted_rps)
+        CONFIDENCE_GAUGE.set(event.confidence)
+
+        self.state.events.append(event)
+        # Keep last 500 events
+        if len(self.state.events) > 500:
+            self.state.events = self.state.events[-500:]
+
+        return success
+
+
+# ──────────────────────────────────────────────
+# Controller Loop
+# ──────────────────────────────────────────────
+async def controller_loop(shutdown_event: asyncio.Event):
+    """Main control loop — runs continuously until shutdown."""
+    scaler = HybridScaler()
+
     logger.info("=" * 60)
-    logger.info("DOCKER COMPOSE MODE - Metrics Monitoring Only")
+    logger.info("[CTRL] Hybrid Predictive Scaling Controller Starting")
+    logger.info(f"   Target: {TARGET_DEPLOYMENT}")
+    logger.info(f"   Namespace: {NAMESPACE}")
+    logger.info(f"   Poll interval: {POLL_INTERVAL}s")
+    logger.info(f"   Confidence threshold: {CONFIDENCE_THRESHOLD}")
+    logger.info(f"   Weights: predictive={PREDICTION_WEIGHT}, reactive={REACTIVE_WEIGHT}")
+    logger.info(f"   Bounds: [{MIN_REPLICAS}, {MAX_REPLICAS}]")
+    logger.info(f"   Dry run: {DRY_RUN}")
     logger.info("=" * 60)
-    logger.info("To enable predictive scaling, deploy to Kubernetes")
-    logger.info("")
-    
-    session = create_session_with_retries()
-    
-    while True:
+
+    iteration = 0
+    while not shutdown_event.is_set():
+        iteration += 1
         try:
-            # Fetch and display metrics
-            try:
-                resp = session.get(ML_SERVICE_URL, timeout=5)
-                resp.raise_for_status()
-                data = resp.json()
-                
-                if data.get("status") == "ready":
-                    predicted_rps = data.get("predicted_rps", 0.0)
-                    conf_lower = data.get("confidence_lower")
-                    conf_upper = data.get("confidence_upper")
-                    
-                    logger.info(f"📊 Predicted RPS: {predicted_rps:.2f} req/s | "
-                              f"Confidence: [{conf_lower:.1f}, {conf_upper:.1f}] | "
-                              f"Status: {data.get('status')}")
-                else:
-                    logger.info(f"⏳ ML Service building model... (status: {data.get('status')})")
-            except requests.exceptions.RequestException as e:
-                logger.error(f"❌ Error accessing ML Service: {e}")
-                
+            logger.info(f"\n{'─' * 40} Iteration {iteration} {'─' * 40}")
+
+            # Compute scaling decision
+            event = await scaler.compute_scaling_decision()
+
+            # Execute scaling
+            await scaler.execute_scaling(event)
+
+            # Log state summary
+            state = scaler.state
+            logger.info(
+                f"[STATE] State: replicas={state.current_replicas}, "
+                f"total_ups={state.total_scale_ups}, "
+                f"total_downs={state.total_scale_downs}"
+            )
+
         except Exception as e:
-            logger.error(f"Error in metrics monitor: {e}")
-            
-        time.sleep(POLL_INTERVAL_SECONDS)
+            logger.error(f"[ERROR] Controller error: {e}", exc_info=True)
+
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=POLL_INTERVAL)
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("[STOP] Controller loop shutting down gracefully")
+
+
+# ──────────────────────────────────────────────
+# REST API for Controller Status
+# ──────────────────────────────────────────────
+from fastapi import FastAPI, Response as FastAPIResponse
+from fastapi.middleware.cors import CORSMiddleware
+
+api = FastAPI(title="Scaling Controller API", version="1.0.0")
+
+api.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@api.get("/health")
+async def health():
+    return {"status": "healthy", "service": "scaling-controller"}
+
+
+@api.get("/status")
+async def status():
+    return {
+        "service": "scaling-controller",
+        "target_deployment": TARGET_DEPLOYMENT,
+        "namespace": NAMESPACE,
+        "dry_run": DRY_RUN,
+        "poll_interval": POLL_INTERVAL,
+        "config": {
+            "min_replicas": MIN_REPLICAS,
+            "max_replicas": MAX_REPLICAS,
+            "confidence_threshold": CONFIDENCE_THRESHOLD,
+            "prediction_weight": PREDICTION_WEIGHT,
+            "reactive_weight": REACTIVE_WEIGHT,
+            "scale_up_cooldown": SCALE_UP_COOLDOWN,
+            "scale_down_cooldown": SCALE_DOWN_COOLDOWN,
+            "max_scale_step": MAX_SCALE_STEP,
+        },
+    }
+
+
+@api.get("/metrics")
+async def metrics():
+    """Expose Prometheus metrics."""
+    return FastAPIResponse(
+        content=generate_latest(ctrl_registry),
+        media_type="text/plain; charset=utf-8",
+    )
+
+
+# ──────────────────────────────────────────────
+# Entrypoint
+# ──────────────────────────────────────────────
+async def main():
+    """Start both the controller loop and the status API."""
+    import uvicorn
+
+    shutdown_event = asyncio.Event()
+
+    # Register signal handlers for graceful shutdown
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, shutdown_event.set)
+        except NotImplementedError:
+            # Windows doesn't support add_signal_handler
+            signal.signal(sig, lambda s, f: shutdown_event.set())
+
+    config = uvicorn.Config(api, host="0.0.0.0", port=8002, log_level="warning")
+    server = uvicorn.Server(config)
+
+    # Run controller loop and API server concurrently
+    await asyncio.gather(
+        controller_loop(shutdown_event),
+        server.serve(),
+    )
+
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
+

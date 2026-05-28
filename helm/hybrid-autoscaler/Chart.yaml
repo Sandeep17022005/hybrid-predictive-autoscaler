@@ -1,0 +1,15 @@
+apiVersion: v2
+name: hybrid-autoscaler
+description: Hybrid Predictive AutoScaler — ML-based predictive scaling combined with Kubernetes HPA
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+keywords:
+  - autoscaling
+  - kubernetes
+  - machine-learning
+  - hpa
+  - predictive
+home: https://github.com/Sandeep17022005/hybrid-predictive-autoscaler
+maintainers:
+  - name: Sandeep17022005

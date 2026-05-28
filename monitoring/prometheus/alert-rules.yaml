@@ -1,0 +1,76 @@
+﻿# ──────────────────────────────────────────────
+# Prometheus Alert Rules for Hybrid Autoscaler
+# ──────────────────────────────────────────────
+groups:
+  - name: autoscaler_alerts
+    rules:
+      # High request latency
+      - alert: HighRequestLatency
+        expr: histogram_quantile(0.95, rate(app_request_latency_seconds_bucket[5m])) > 1.0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High P95 request latency (> 1s)"
+          description: "P95 latency is {{ $value }}s for the workload service"
+
+      # High error rate
+      - alert: HighErrorRate
+        expr: rate(app_request_total{status=~"5.."}[5m]) / rate(app_request_total[5m]) > 0.05
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High error rate (> 5%)"
+          description: "Error rate is {{ $value | humanizePercentage }}"
+
+      # Pod count near maximum
+      - alert: CloseToMaxReplicas
+        expr: kube_deployment_spec_replicas{deployment="workload-service"} >= 45
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Workload service approaching max replicas"
+          description: "Current replicas: {{ $value }}, max: 50"
+
+      # Prediction service down
+      - alert: PredictionServiceDown
+        expr: up{job="prediction-service"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Prediction service is down"
+          description: "ML prediction service is unreachable — autoscaler falling back to reactive mode"
+
+      # Scaling controller down
+      - alert: ScalingControllerDown
+        expr: up{job="scaling-controller"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Scaling controller is down"
+          description: "Hybrid scaling controller is unreachable — only HPA reactive scaling is active"
+
+      # High CPU utilization
+      - alert: HighCPUUtilization
+        expr: avg(rate(container_cpu_usage_seconds_total{container="workload-service"}[5m])) by (pod) > 0.8
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High CPU utilization on workload service pod"
+          description: "CPU usage: {{ $value | humanizePercentage }}"
+
+      # Request rate spike
+      - alert: RequestRateSpike
+        expr: rate(app_request_total[1m]) > 3 * rate(app_request_total[10m])
+        for: 1m
+        labels:
+          severity: info
+        annotations:
+          summary: "Traffic spike detected"
+          description: "Request rate spiked 3x above the 10-minute average"
+
